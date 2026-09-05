@@ -4,8 +4,9 @@
 #
 # Usage (from a NixOS live ISO, after cloning this repo):
 #
-#   sudo ./install-live.sh                     # pick a disk interactively
-#   sudo ./install-live.sh /dev/nvme0n1        # specify the disk
+#   ./install-live.sh                        # pick a disk interactively
+#   sudo ./install-live.sh /dev/nvme0n1      # specify the disk
+#   sudo NIX_BUILD_JOBS=2 ./install-live.sh /dev/vda   # cap RAM during build
 #
 # What it does, in order:
 #   1. Verifies the target disk is not the one the ISO is running from.
@@ -14,7 +15,9 @@
 #   3. Mounts everything under /mnt and regenerates hardware-configuration.nix
 #      from the actual disk (correct UUIDs and subvolume options).
 #   4. Copies THIS repo into /mnt/etc/nixos.
-#   5. Runs nixos-install from the flake (passwordless root; zram covers swap).
+#   5. Runs nixos-install from the flake (passwordless root). Builds are
+#      bounded to $NIX_BUILD_CORES cores / $NIX_BUILD_JOBS jobs, and a
+#      $SWAP_SIZE_MB disk swapfile is enabled during the build.
 #   6. Asks you for a password for user "mihai" and sets it in the chroot.
 #
 # After it finishes: unmount and reboot. Log in as mihai.
@@ -28,6 +31,16 @@ MOUNT="/mnt"
 HOST="nixos"            # must match flake.nix's output attribute name
 USERNAME="mihai"
 ESP_SIZE="1G"
+
+# Nix build parallelism - keep RAM usage bounded (defaults suit a VM).
+NIX_BUILD_CORES="${NIX_BUILD_CORES:-6}"   # cores made available per build job
+NIX_BUILD_JOBS="${NIX_BUILD_JOBS:-3}"     # concurrent build jobs
+
+# Disk swapfile, created on the target root and used during the build. The
+# installed system keeps it (swapDevices = /swapfile via hardware-config.nix).
+# Set SWAP_SIZE_MB=0 to skip.
+SWAP_SIZE_MB="${SWAP_SIZE_MB:-4096}"
+SWAP_FILE="${SWAP_FILE:-$MOUNT/swapfile}"
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -53,7 +66,8 @@ prompt_disk() {
 [[ $# -gt 1 ]] && die "usage: $0 [disk]"
 [[ $EUID -eq 0 ]] || die "run with sudo: sudo $0 $*"
 
-for c in sgdisk partprobe mkfs.fat mkfs.btrfs btrfs git nixos-install nixos-generate-config; do
+for c in sgdisk partprobe mkfs.fat mkfs.btrfs btrfs git nixos-install nixos-generate-config \
+         dd chattr mkswap swapon swapoff; do
   require_cmd "$c"
 done
 
@@ -100,7 +114,7 @@ mkfs.btrfs -f "$P2"
 
 echo "==> Creating subvolumes @, @home, @nix"
 mount "$P2" "$MOUNT"
-trap 'umount -R "$MOUNT" 2>/dev/null || true' EXIT
+trap 'swapoff "$SWAP_FILE" 2>/dev/null || true; umount -R "$MOUNT" 2>/dev/null || true' EXIT
 btrfs subvolume create "$MOUNT/@"
 btrfs subvolume create "$MOUNT/@home"
 btrfs subvolume create "$MOUNT/@nix"
@@ -113,6 +127,20 @@ mount -o subvol=@home,compress=zstd,noatime "$P2" "$MOUNT/home"
 mount -o subvol=@nix,compress=zstd,noatime "$P2" "$MOUNT/nix"
 mount "$P1" "$MOUNT/boot"
 
+if [[ ${SWAP_SIZE_MB:-0} -gt 0 ]]; then
+  echo "==> Creating ${SWAP_SIZE_MB}M btrfs swapfile at $SWAP_FILE (nocow, no compression)"
+  truncate -s 0 "$SWAP_FILE"
+  chattr +C "$SWAP_FILE" 2>/dev/null || true
+  btrfs property set "$SWAP_FILE" compression none 2>/dev/null || true
+  dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$SWAP_SIZE_MB" conv=fsync status=none
+  chmod 600 "$SWAP_FILE"
+  mkswap "$SWAP_FILE" >/dev/null
+  swapon "$SWAP_FILE"
+  echo "    swapfile ${SWAP_SIZE_MB}M enabled ($(free -h | awk 'NR==2 {print $2" total"}'))"
+else
+  echo "==> Skipping swapfile (SWAP_SIZE_MB=0)"
+fi
+
 echo "==> Generating hardware-configuration.nix for this disk"
 nixos-generate-config --root "$MOUNT"
 cp "$MOUNT/etc/nixos/hardware-configuration.nix" /tmp/hardware-configuration.nix
@@ -123,14 +151,27 @@ cp -a "$REPO_DIR"/. "$MOUNT/etc/nixos/"
 # The freshly generated file wins over whatever UUIDs the repo was committed with.
 cp /tmp/hardware-configuration.nix "$MOUNT/etc/nixos/hardware-configuration.nix"
 
+if [[ ${SWAP_SIZE_MB:-0} -gt 0 ]]; then
+  # Keep the swapfile active on the installed system. This edits the
+  # machine-specific generated config, so it never affects your host.
+  HW="$MOUNT/etc/nixos/hardware-configuration.nix"
+  if grep -q 'swapDevices = \[ \];' "$HW"; then
+    sed -i 's|swapDevices = \[ \];|swapDevices = [ { device = "/swapfile"; } ];|' "$HW"
+  else
+    grep -q '/swapfile' "$HW" || printf '\n  swapDevices = [ { device = "/swapfile"; } ];\n' >> "$HW"
+  fi
+fi
+
 echo "==> Installing the system (this downloads and builds - may take a while)"
-nixos-install --no-root-passwd --flake "$MOUNT/etc/nixos#$HOST"
+nixos-install --no-root-passwd --flake "$MOUNT/etc/nixos#$HOST" \
+  --cores "$NIX_BUILD_CORES" --max-jobs "$NIX_BUILD_JOBS"
 
 echo "==> Setting a password for user '$USERNAME'"
 nixos-enter --root "$MOUNT" -- passwd "$USERNAME"
 
 echo
 echo "==> Installation complete. Unmounting and ready to reboot."
+swapoff "$SWAP_FILE" 2>/dev/null || true
 umount -R "$MOUNT"
 trap - EXIT
 
@@ -140,5 +181,8 @@ echo "  sudo reboot          # boot into the installed system"
 echo "  Log in as: $USERNAME (the password you just chose)"
 echo
 echo "Notes:"
-echo "  - No swap partition: zramSwap (50% RAM) is enabled in the config."
+echo "  - zramSwap (50% RAM) is enabled, plus a ${SWAP_SIZE_MB}M disk swapfile"
+echo "    at /swapfile (configured in the generated hardware-configuration.nix)."
+echo "  - Build parallelism can be capped via NIX_BUILD_JOBS/NIX_BUILD_CORES;"
+echo "    e.g. NIX_BUILD_JOBS=1 sudo ./install-live.sh /dev/vda."
 echo "  - To change anything, edit $MOUNT/etc/nixos, rebuild, commit, push."
