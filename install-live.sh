@@ -58,7 +58,13 @@ for c in sgdisk partprobe mkfs.fat mkfs.btrfs btrfs git nixos-install nixos-gene
 done
 
 DISK="${1:-$(prompt_disk)}"
-[[ -b $DISK ]] || die "'$DISK' is not a block device."
+if [[ ! -b $DISK ]]; then
+  echo "ERROR: '$DISK' is not a block device." >&2
+  echo "Available disks:" >&2
+  lsblk -dpno NAME,SIZE,MODEL | sed 's/^/  /' >&2
+  echo "In a VM the disk is often /dev/vda, /dev/sda or /dev/vdb - check 'lsblk'." >&2
+  exit 1
+fi
 
 # Safety: never touch a disk that has any mounted partition (the ISO's own
 # disk would be mounted under /run/media, /nix, etc.).
@@ -83,10 +89,10 @@ sgdisk -n 2:0:0 -t 2:8300 -c 2:nixos "$DISK"
 partprobe "$DISK"
 sleep 2
 
-# Resolve partition nodes (nvme0n1p1 vs sda1).
-P1="$(lsblk -rno NAME "$DISK" | sed -n 2p | sed 's#^#/dev/#')"
-P2="$(lsblk -rno NAME "$DISK" | sed -n 3p | sed 's#^#/dev/#')"
-[[ -b $P1 ]] && [[ -b $P2 ]] || die "could not resolve partition devices for $DISK"
+# Resolve partition nodes robustly (nvme0n1 -> nvme0n1p1, vda -> vda1).
+P1="$( { [[ -b ${DISK}p1 ]] && echo "${DISK}p1"; } || echo "${DISK}1" )"
+P2="$( { [[ -b ${DISK}p2 ]] && echo "${DISK}p2"; } || echo "${DISK}2" )"
+[[ -b $P1 ]] && [[ -b $P2 ]] || die "could not resolve partition devices for $DISK (got $P1, $P2)"
 
 echo "==> Formatting $P1 (FAT32) and $P2 (btrfs)"
 mkfs.fat -F 32 "$P1"
