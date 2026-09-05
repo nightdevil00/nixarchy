@@ -2,6 +2,33 @@
 # replaces the GNOME/GDM desktop with Omarchy's Hyprland behind SDDM.
 { config, lib, pkgs, nixarchy, ... }:
 
+let
+  # Launch a browser with Mesa EGL (the GPU Hyprland composites on) and the
+  # matching VAAPI driver, working around cross-GPU DMA-BUF import failures on
+  # hybrid NVIDIA + iGPU laptops (EGL_BAD_MATCH, black screens, flicker).
+  # Applied from ~/Downloads/fix_chromium.md. Desktop overrides in
+  # ~/.local/share/applications/ route the launcher entries through these.
+  browserLauncher = launcher: binary: pkgs.writeShellScriptBin launcher ''
+    MESA_EGL=/run/opengl-driver/share/glvnd/egl_vendor.d/50_mesa.json
+    if [[ -f $MESA_EGL ]]; then
+      export __EGL_VENDOR_LIBRARY_FILENAMES="$MESA_EGL"
+    fi
+
+    IGPU="$(lspci 2>/dev/null | grep -iE 'vga|3d|display' | grep -iv 'nvidia' | grep -iE 'intel|amd|advanced micro devices|radeon|ati ')"
+    if echo "$IGPU" | grep -qi intel; then
+      export LIBVA_DRIVER_NAME=iHD
+    elif [[ -n $IGPU ]]; then
+      export LIBVA_DRIVER_NAME=radeonsi
+    fi
+
+    exec ${binary} \
+      --ozone-platform=wayland \
+      --ozone-platform-hint=wayland \
+      --password-store=gnome-libsecret \
+      --enable-features=TouchpadOverscrollHistoryNavigation \
+      "$@"
+  '';
+in
 {
   imports =
     [
@@ -80,7 +107,15 @@
   hardware.graphics = {
     enable = true;
     enable32Bit = true;
-    extraPackages = with pkgs; [ intel-media-driver ];
+    extraPackages = with pkgs; [
+      intel-media-driver
+      nvidia-vaapi-driver
+    ];
+  };
+
+  environment.variables = {
+    LIBVA_DRIVERS_PATH = "/run/opengl-driver/lib/dri";
+    OMARCHY_SCREENRECORD_USE_PORTAL = "true";
   };
 
   services.xserver.videoDrivers = [ "nvidia" ];
@@ -103,11 +138,19 @@
   ##########################################################################
   boot.kernelPackages = pkgs.linuxPackages_latest;
 
+  ##########################################################################
+  # Memory -- zram compressed swap.
+  ##########################################################################
+  zramSwap = {
+    enable = true;
+    memoryPercent = 50;
+  };
+
   # Define a user account.
   users.users."mihai" = {
     isNormalUser = true;
     description = "Mihai";
-    extraGroups = [ "networkmanager" "wheel" "input" ];
+    extraGroups = [ "networkmanager" "wheel" "input" "libvirtd" ];
     packages = with pkgs; [
       git
       wget
@@ -116,6 +159,11 @@
       google-chrome
     ];
   };
+
+  # GNOME Boxes needs the libvirt/QEMU stack to check and use KVM. Without it
+  # Boxes fails its virsh check and reports "Oops! no KVM" even though /dev/kvm
+  # and the kvm-intel module are fine.
+  virtualisation.libvirtd.enable = true;
 
   # Install firefox.
   programs.firefox.enable = true;
@@ -132,6 +180,8 @@
     wget
     curl
     vim
+    (browserLauncher "omarchy-launch-chromium" "${pkgs.chromium}/bin/chromium")
+    (browserLauncher "omarchy-launch-google-chrome" "${pkgs.google-chrome}/bin/google-chrome-stable")
   ];
 
   system.stateVersion = "26.05";
