@@ -1,0 +1,15 @@
+# Build outputs — store symlinks, meaningless elsewhere
+result
+result-*
+
+.direnv/
+*.swp
+
+# Plaintext secrets
+*.key
+*.pem
+id_rsa
+id_ed25519
+.env
+.env.*
+secrets/*.txt
